@@ -3,9 +3,6 @@
   "version": "1.0.0",
   "description": "API Scraper TikTok dan Komentar untuk Preset Alight Motion",
   "main": "index.js",
-  "engines": {
-    "node": "18.x"
-  },
   "dependencies": {
     "axios": "^1.6.8"
   }
