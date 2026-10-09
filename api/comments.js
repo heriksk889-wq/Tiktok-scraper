@@ -4,9 +4,9 @@ export default async function handler(req, res) {
    res.setHeader('Access-Control-Allow-Origin', '*');
    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
 
-   const targetUrl = req.query.url || req.query.query;
+   const inputUrl = req.query.url || req.query.query;
 
-   if (!targetUrl || !targetUrl.includes('tiktok.com')) {
+   if (!inputUrl || !inputUrl.includes('tiktok.com')) {
       return res.status(400).json({ 
          success: false, 
          message: 'URL TikTok tidak valid atau kosong.' 
@@ -14,20 +14,42 @@ export default async function handler(req, res) {
    }
 
    try {
-      // 1. Ambil data video & play URL via tikwm
-      const tikwmUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(targetUrl)}`;
-      const tikwmRes = await axios.get(tikwmUrl, { timeout: 15000 });
+      let longUrl = inputUrl;
+      let targetVideoId = '';
+
+      // 1. AUTO-EXPAND SHORTLINK (Wajib agar amfinder tidak nyasar)
+      if (inputUrl.includes('vt.tiktok.com') || inputUrl.includes('vm.tiktok.com')) {
+         try {
+            const expandRes = await axios.get(inputUrl, {
+               maxRedirects: 5,
+               validateStatus: status => status >= 200 && status < 400,
+               headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0' }
+            });
+            const resolved = expandRes.request?.res?.responseUrl || expandRes.config?.url || inputUrl;
+            longUrl = resolved.split('?')[0]; 
+         } catch (e) {
+            console.log('Gagal expand shortlink:', e.message);
+         }
+      }
+
+      // Ambil ID Video untuk pencocokan akurat
+      const idMatch = longUrl.match(/video\/(\d+)/);
+      if (idMatch) targetVideoId = idMatch[1];
+
+      // 2. Ambil data video via tikwm
+      const tikwmUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(longUrl)}`;
+      const tikwmRes = await axios.get(tikwmUrl, { timeout: 15000 }).catch(() => ({}));
       const videoData = tikwmRes.data?.data || {};
 
-      // 2. Ambil data preset dari amfinder API langsung dari server Vercel (IP bersih)
+      // 3. Ambil data preset dari amfinder menggunakan URL Panjang
       const params = new URLSearchParams();
-      params.append('query', targetUrl);
-      params.append('q', targetUrl);
+      params.append('query', longUrl);
+      params.append('q', longUrl);
 
       const amfinderUrl = `https://amfinder.web.id/api/search?${params.toString()}`;
       const amfinderRes = await axios.get(amfinderUrl, {
          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
             'Referer': 'https://amfinder.web.id/',
             'Accept': 'text/event-stream, application/json'
          },
@@ -37,8 +59,9 @@ export default async function handler(req, res) {
       const rawText = typeof amfinderRes.data === 'string' ? amfinderRes.data : JSON.stringify(amfinderRes.data);
       const lines = rawText.split('\n');
       let allPresets = [];
+      let isTargetFound = false;
 
-      // Parsing struktur event stream dari amfinder
+      // Parsing struktur event stream dari amfinder (HANYA TARGET VIDEO)
       for (const line of lines) {
          if (line.startsWith('data:')) {
             try {
@@ -46,60 +69,44 @@ export default async function handler(req, res) {
                const parsed = JSON.parse(jsonStr);
 
                const videoList = parsed.videos || (parsed.presetLinks ? [parsed] : null);
-               if (videoList && Array.isArray(videoList)) {
-                  videoList.forEach(video => {
-                     if (video.presetLinks && Array.isArray(video.presetLinks)) {
-                        video.presetLinks.forEach(item => {
-                           if (typeof item === 'object' && item.url) {
-                              allPresets.push({
-                                 url: item.url,
-                                 source: item.source || 'comments',
-                                 author: item.author || video.handle || 'Komentar'
-                              });
-                           } else if (typeof item === 'string') {
-                              allPresets.push({
-                                 url: item,
-                                 source: 'comments',
-                                 author: 'Komentar'
-                              });
-                           }
-                        });
-                     }
-                  });
+               
+               if (videoList && Array.isArray(videoList) && videoList.length > 0) {
+                  // Filter HANYA video yang ID-nya cocok dengan URL yang diminta
+                  const mainVideo = targetVideoId 
+                     ? videoList.find(v => v.url && v.url.includes(targetVideoId)) || videoList[0]
+                     : videoList[0];
+
+                  if (mainVideo && mainVideo.presetLinks && Array.isArray(mainVideo.presetLinks)) {
+                     mainVideo.presetLinks.forEach(item => {
+                        if (typeof item === 'object' && item.url) {
+                           allPresets.push({
+                              url: item.url,
+                              source: item.source || 'comments',
+                              author: item.author || mainVideo.handle || 'Komentar'
+                           });
+                        } else if (typeof item === 'string') {
+                           allPresets.push({
+                              url: item,
+                              source: 'comments',
+                              author: 'Komentar'
+                           });
+                        }
+                     });
+                     isTargetFound = true;
+                     break; // HENTIKAN LOOP! Jangan ambil data dari video orang lain
+                  }
                }
             } catch (e) {}
          }
+         if (isTargetFound) break; // Keluar dari parsing jika target sudah ketemu
       }
 
-      // Fallback Universal Regex Scanner jika terstruktur kosong
-      if (allPresets.length === 0) {
-         const cleanedText = rawText.replace(/\\/g, '');
-         const urlRegex = /(https?:\/\/[^\s"'<>]+)/g;
-         const foundUrls = cleanedText.match(urlRegex) || [];
-         
-         const filteredUrls = foundUrls.filter(url => 
-            url.includes('alight.link') || 
-            url.includes('alightcreative.com') || 
-            url.includes('drive.google.com') || 
-            url.includes('pastebin.com') || 
-            url.includes('mediafire.com') ||
-            url.includes('mega.nz') ||
-            url.toLowerCase().includes('xml')
-         );
-
-         filteredUrls.forEach(url => {
-            allPresets.push({
-               url: url.replace(/['",;\\}]+$/, ''),
-               source: 'comments',
-               author: 'Kreator / Komentar'
-            });
-         });
-      }
-
+      // Hapus duplikat link
       const uniquePresets = Array.from(new Map(allPresets.map(p => [p.url, p])).values());
 
       return res.status(200).json({
          success: true,
+         debug_url: longUrl,
          video: {
             title: videoData.title || '',
             play: videoData.play || '',
