@@ -6,43 +6,55 @@ export default async function handler(req, res) {
 
    const inputUrl = req.query.url || req.query.query;
 
-   // Cegah pengiriman 400/500 ke bot. Jika URL salah, kembalikan 200 dengan success false.
    if (!inputUrl || !inputUrl.includes('tiktok.com')) {
       return res.status(200).json({ success: false, presets: [] });
    }
 
    try {
-      let longUrl = inputUrl;
       let videoId = '';
+      let videoTitle = 'Video TikTok';
+      let playUrl = '';
 
-      // 1. Expand Shortlink TikTok (vt.tiktok.com)
-      if (inputUrl.includes('vt.tiktok.com') || inputUrl.includes('vm.tiktok.com')) {
-         try {
-            const expandRes = await axios.get(inputUrl, {
-               maxRedirects: 5,
-               validateStatus: s => s >= 200 && s < 400,
-               headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-            });
-            longUrl = expandRes.request?.res?.responseUrl || expandRes.config?.url || inputUrl;
-            longUrl = longUrl.split('?')[0];
-         } catch (e) {}
+      // 1. DAPATKAN VIDEO ID VIA API (PRIORITAS UTAMA)
+      // Dipindah ke baris teratas agar IP Vercel tidak perlu berurusan dengan Cloudflare TikTok
+      // saat mencoba mengekspansi vt.tiktok.com secara manual.
+      try {
+         const videoDetail = await axios.get(`https://www.tikwm.com/api/?url=${inputUrl}`);
+         if (videoDetail.data && videoDetail.data.data) {
+             videoId = videoDetail.data.data.id;
+             videoTitle = videoDetail.data.data.title || videoTitle;
+             playUrl = videoDetail.data.data.play || playUrl;
+         }
+      } catch(e) {
+         console.log('API metadata gagal resolve URL:', e.message);
       }
 
-      // 2. Ekstrak Video ID (Lebih fleksibel)
-      const videoIdMatch = longUrl.match(/video\/(\d+)/) || longUrl.match(/v\/(\d+)/);
-      if (videoIdMatch) {
-          videoId = videoIdMatch[1];
+      // Fallback: Jika API gagal, baru coba bedah URL manual
+      if (!videoId) {
+          let longUrl = inputUrl;
+          if (inputUrl.includes('vt.tiktok.com') || inputUrl.includes('vm.tiktok.com')) {
+             try {
+                const expandRes = await axios.get(inputUrl, {
+                   maxRedirects: 5,
+                   validateStatus: s => s >= 200 && s < 400,
+                   headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+                });
+                longUrl = expandRes.request?.res?.responseUrl || expandRes.config?.url || inputUrl;
+                longUrl = longUrl.split('?')[0];
+             } catch (e) {}
+          }
+          const videoIdMatch = longUrl.match(/video\/(\d+)/) || longUrl.match(/v\/(\d+)/);
+          if (videoIdMatch) videoId = videoIdMatch[1];
       }
 
+      // Hentikan eksekusi jika ID Video tetap tidak berhasil didapat
       if (!videoId) {
           return res.status(200).json({ success: false, presets: [] });
       }
 
       let allPresets = [];
-      let videoTitle = 'Video TikTok';
-      let playUrl = '';
 
-      // Engine pembedah link super agresif
+      // Engine pembedah tautan
       const searchLinks = (text) => {
           if (!text) return;
           const words = text.split(/[\s\n]+/);
@@ -56,59 +68,64 @@ export default async function handler(req, res) {
                 lower.includes('whatsapp.com/channel') || lower.includes('.xml');
 
              if (isValidPreset) {
-                // Pasang protokol https:// paksa agar link hidup di WhatsApp
                 if (!cleanUrl.startsWith('http')) cleanUrl = 'https://' + cleanUrl;
                 allPresets.push({ url: cleanUrl, source: 'comments' });
              }
           });
       };
 
-      // 3. METODE UTAMA: TikTok Internal Mobile API (Anti-Blokir / Tanpa API Key)
-      try {
-         const tiktokApiUrl = `https://api16-normal-c-useast1a.tiktokv.com/aweme/v2/comment/list/?aweme_id=${videoId}&count=100`;
-         const commentsRes = await axios.get(tiktokApiUrl, {
-             headers: { 'User-Agent': 'TikTok 26.2.0 rv:262018 (iPhone; iOS 14.4.2; en_US) Cronet' },
-             timeout: 10000
-         });
-
-         if (commentsRes.data && commentsRes.data.comments) {
-             commentsRes.data.comments.forEach(c => {
-                searchLinks(c.text);
-                // Cek balasan komentar (Replies)
-                if (c.reply_comment && Array.isArray(c.reply_comment)) {
-                    c.reply_comment.forEach(reply => searchLinks(reply.text));
-                }
-             });
-         }
-      } catch(e) {
-         console.log('Metode Internal Gagal:', e.message);
-      }
-
-      // 4. METODE CADANGAN: Fallback ke TikWM hanya jika API Internal sedang kosong
-      if (allPresets.length === 0) {
+      // 2. SISTEM PAGINATION UNTUK KOMENTAR TERKUBUR
+      let cursor = 0;
+      let hasMore = true;
+      let loopCount = 0;
+      
+      // Loop maksimal 3 halaman (mencapai 300 komentar terdalam)
+      // Dibatasi ke 3 agar Vercel tidak terkena timeout execution.
+      while (hasMore && loopCount < 3) {
           try {
-              const tikwmRes = await axios.get(`https://www.tikwm.com/api/comment/list?aweme_id=${videoId}&count=100&cursor=0`);
-              if (tikwmRes.data && tikwmRes.data.data && tikwmRes.data.data.comments) {
-                  tikwmRes.data.data.comments.forEach(c => {
+              const commentsRes = await axios.get(`https://www.tikwm.com/api/comment/list?aweme_id=${videoId}&count=100&cursor=${cursor}`);
+              const data = commentsRes.data?.data;
+              
+              if (data && data.comments && data.comments.length > 0) {
+                  data.comments.forEach(c => {
                       searchLinks(c.text);
+                      // Bedah semua balasan (replies) di halaman ini
                       if (c.reply_comment && Array.isArray(c.reply_comment)) {
                           c.reply_comment.forEach(reply => searchLinks(reply.text));
                       }
                   });
+                  // Update cursor ke halaman selanjutnya
+                  hasMore = data.has_more === 1;
+                  cursor = data.cursor;
+              } else {
+                  hasMore = false;
               }
+          } catch (e) {
+              hasMore = false;
+          }
+          loopCount++;
+      }
+
+      // 3. METODE CADANGAN: MOBILE API TIKTOK
+      if (allPresets.length === 0) {
+          try {
+             const tiktokApiUrl = `https://api16-normal-c-useast1a.tiktokv.com/aweme/v2/comment/list/?aweme_id=${videoId}&count=100`;
+             const internalRes = await axios.get(tiktokApiUrl, {
+                 headers: { 'User-Agent': 'TikTok 26.2.0 rv:262018 (iPhone; iOS 14.4.2; en_US) Cronet' },
+                 timeout: 10000
+             });
+
+             if (internalRes.data && internalRes.data.comments) {
+                 internalRes.data.comments.forEach(c => {
+                    searchLinks(c.text);
+                    if (c.reply_comment && Array.isArray(c.reply_comment)) {
+                        c.reply_comment.forEach(reply => searchLinks(reply.text));
+                    }
+                 });
+             }
           } catch(e) {}
       }
-      
-      // 5. Opsional: Tarik metadata video agar bot bisa kirim video MP4-nya
-      try {
-         const videoDetail = await axios.get(`https://www.tikwm.com/api/?url=${inputUrl}`);
-         if (videoDetail.data.code === 0 && videoDetail.data.data) {
-             videoTitle = videoDetail.data.data.title || videoTitle;
-             playUrl = videoDetail.data.data.play || playUrl;
-         }
-      } catch(e) {}
 
-      // Bersihkan duplikat
       const uniquePresets = Array.from(new Map(allPresets.map(p => [p.url, p])).values());
 
       return res.status(200).json({
@@ -118,9 +135,7 @@ export default async function handler(req, res) {
       });
 
    } catch (error) {
-      // PERBAIKAN FATAL ERROR:
-      // Selalu kembalikan 200 OK agar bot di Pterodactyl tidak menerima status kode 500
       return res.status(200).json({ success: false, presets: [] });
    }
              }
-                
+                                 
