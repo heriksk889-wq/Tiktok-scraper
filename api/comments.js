@@ -11,103 +11,83 @@ export default async function handler(req, res) {
    try {
       let longUrl = inputUrl;
       
-      // 1. Auto-expand shortlink agar jadi URL panjang asli
+      // 1. Auto-expand shortlink (vt.tiktok.com / vm.tiktok.com)
       if (inputUrl.includes('vt.tiktok.com') || inputUrl.includes('vm.tiktok.com')) {
          try {
             const expandRes = await fetch(inputUrl, {
                redirect: 'follow',
-               headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0' }
+               headers: { 
+                  'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1' 
+               }
             });
             longUrl = expandRes.url.split('?')[0]; 
          } catch (e) {}
       }
 
-      // Ambil ID Video untuk pencocokan ketat
-      const videoIdMatch = longUrl.match(/video\/(\d+)/);
-      const videoId = videoIdMatch ? videoIdMatch[1] : '';
+      // 2. Fetch halaman HTML TikTok secara langsung
+      const pageRes = await fetch(longUrl, {
+         headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+         }
+      });
 
-      // 2. Ambil data video dasar via TikWM (hanya untuk judul & author)
-      let videoData = {};
-      try {
-         const tikwmRes = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(longUrl)}`);
-         const tikwmJson = await tikwmRes.json();
-         videoData = tikwmJson.data || {};
-      } catch (e) {}
+      const htmlText = await pageRes.text();
 
       let allPresets = [];
+      let videoTitle = '';
 
-      // 3. Tembak Amfinder dengan URL panjang yang sudah bersih
+      // 3. Ambil judul/deskripsi video dari struktur SIGI_STATE jika tersedia
       try {
-         const amfinderUrl = `https://amfinder.web.id/api/search?query=${encodeURIComponent(longUrl)}&q=${encodeURIComponent(longUrl)}`;
-         const amfinderRes = await fetch(amfinderUrl, {
-            headers: {
-               'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-               'Referer': 'https://amfinder.web.id/',
-               'Accept': 'text/event-stream, application/json'
-            }
-         });
-
-         const rawText = await amfinderRes.text();
-         const lines = rawText.split('\n');
-
-         for (const line of lines) {
-            if (line.startsWith('data:')) {
-               try {
-                  const parsed = JSON.parse(line.replace('data:', '').trim());
-                  const videoList = parsed.videos || (parsed.presetLinks ? [parsed] : null);
-
-                  if (videoList && Array.isArray(videoList)) {
-                     // STRICT MATCHING: Cari video yang URL atau ID-nya benar-benar sama persis
-                     const targetVideo = videoId 
-                        ? videoList.find(v => v.url && v.url.includes(videoId)) 
-                        : null;
-
-                     // Jika ketemu video yang pas, ambil presetLinks-nya
-                     if (targetVideo && targetVideo.presetLinks && Array.isArray(targetVideo.presetLinks)) {
-                        targetVideo.presetLinks.forEach(item => {
-                           const pUrl = typeof item === 'object' ? item.url : item;
-                           const pAuthor = typeof item === 'object' ? (item.author || targetVideo.handle || 'Komentar') : 'Komentar';
-                           
-                           if (pUrl) {
-                              allPresets.push({
-                                 url: pUrl.replace(/['",;\\}\n\r\)]+$/, ''),
-                                 source: 'comments',
-                                 author: pAuthor
-                              });
-                           }
-                        });
-                        break; // Berhenti karena video target sudah ketemu
-                     }
-                  }
-               } catch (err) {}
+         const sigiMatch = htmlText.match(/<script id="SIGI_STATE" type="application\/json">([\s\S]*?)<\/script>/);
+         if (sigiMatch && sigiMatch[1]) {
+            const sigiJson = JSON.parse(sigiMatch[1]);
+            const itemModule = sigiJson.ItemModule || {};
+            for (const key in itemModule) {
+               if (itemModule[key].desc) {
+                  videoTitle = itemModule[key].desc;
+               }
             }
          }
       } catch (e) {}
 
-      // Fallback Regex Universal jika event stream amfinder kosong
-      if (allPresets.length === 0) {
-         const urls = rawText.match(/(https?:\/\/[^\s"'<>]+)/g) || [];
-         urls.forEach(u => {
-            const cleanUrl = u.replace(/['",;\\}\n\r\)]+$/, '');
-            if (!cleanUrl.includes('tiktok.com') && !cleanUrl.includes('byteimg.com')) {
-               allPresets.push({
-                  url: cleanUrl,
-                  source: 'comments',
-                  author: 'Kreator / Komentar'
-               });
-            }
-         });
-      }
+      // 4. Universal HTML Regex Scraper (Sapu bersih seluruh link http/https di halaman)
+      // Karena halaman SSR TikTok memuat teks komentar & deskripsi di dalam HTML, cara ini sangat ampuh menangkap link tersembunyi.
+      const urlRegex = /(https?:\/\/[^\s"'<>]+)/g;
+      const rawMatches = htmlText.match(urlRegex) || [];
 
-      // Hapus duplikat link
+      rawMatches.forEach(u => {
+         let cleanUrl = u.replace(/['",;\\}\n\r\)]+$/, '').replace(/&amp;/g, '&');
+         
+         // Filter domain internal TikTok / sampah agar tidak ikut tersedot
+         if (
+            cleanUrl &&
+            !cleanUrl.includes('tiktok.com') &&
+            !cleanUrl.includes('byteimg.com') &&
+            !cleanUrl.includes('akamaized.net') &&
+            !cleanUrl.includes('musical.ly') &&
+            !cleanUrl.includes('bytedance') &&
+            !cleanUrl.includes('w3.org') &&
+            !cleanUrl.includes('schema.org')
+         ) {
+            allPresets.push({
+               url: cleanUrl,
+               source: 'comments',
+               author: 'Kreator / Komentar'
+            });
+         }
+      });
+
+      // Hapus duplikat URL yang sama
       const uniquePresets = Array.from(new Map(allPresets.map(p => [p.url, p])).values());
 
       return res.status(200).json({
          success: true,
          video: {
-            title: videoData.title || '',
-            play: videoData.play || '',
-            author: videoData.author?.unique_id || ''
+            title: videoTitle || 'Video TikTok',
+            play: '',
+            author: 'TikTok'
          },
          presets: uniquePresets
       });
@@ -115,5 +95,4 @@ export default async function handler(req, res) {
    } catch (error) {
       return res.status(500).json({ success: false, error: error.message });
    }
-            }
-         
+}
