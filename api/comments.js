@@ -1,5 +1,3 @@
-import axios from 'axios';
-
 export default async function handler(req, res) {
    res.setHeader('Access-Control-Allow-Origin', '*');
    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -13,28 +11,35 @@ export default async function handler(req, res) {
    try {
       let longUrl = inputUrl;
       
-      // 1. AUTO-EXPAND SHORTLINK
+      // 1. AUTO-EXPAND SHORTLINK (Menggunakan native fetch)
       if (inputUrl.includes('vt.tiktok.com') || inputUrl.includes('vm.tiktok.com')) {
          try {
-            const expandRes = await axios.get(inputUrl, {
-               maxRedirects: 5,
-               validateStatus: s => s >= 200 && s < 400,
-               headers: { 'User-Agent': 'Mozilla/5.0' }
+            const expandRes = await fetch(inputUrl, {
+               redirect: 'follow',
+               headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0' }
             });
-            const resolved = expandRes.request?.res?.responseUrl || expandRes.config?.url || inputUrl;
-            longUrl = resolved.split('?')[0]; 
-         } catch (e) {}
+            longUrl = expandRes.url.split('?')[0]; 
+         } catch (e) {
+            console.log('Gagal expand URL:', e.message);
+         }
       }
 
       const videoIdMatch = longUrl.match(/video\/(\d+)/);
       const videoId = videoIdMatch ? videoIdMatch[1] : '';
 
-      // 2. AMBIL DATA VIDEO
-      const tikwmUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(longUrl)}`;
-      const tikwmRes = await axios.get(tikwmUrl, { timeout: 15000 }).catch(() => ({}));
-      const videoData = tikwmRes.data?.data || {};
-      const authorId = videoData.author?.id || '';
-      const authorHandle = videoData.author?.unique_id || 'Kreator';
+      // 2. AMBIL DATA VIDEO (Untuk Judul & ID Author)
+      let videoData = {};
+      let authorId = '';
+      let authorHandle = 'Kreator';
+
+      try {
+         const tikwmUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(longUrl)}`;
+         const tikwmRes = await fetch(tikwmUrl);
+         const tikwmJson = await tikwmRes.json();
+         videoData = tikwmJson.data || {};
+         authorId = videoData.author?.id || '';
+         authorHandle = videoData.author?.unique_id || 'Kreator';
+      } catch (e) {}
 
       let allPresets = [];
 
@@ -54,14 +59,14 @@ export default async function handler(req, res) {
 
       extractLinks(videoData.title, 'description', `@${authorHandle} (Kreator)`);
 
-      // 3. SCRAPING KOMENTAR & BALASANNYA (REPLIES)
+      // 3. SCRAPING KOMENTAR & BALASANNYA
       if (videoId) {
          try {
             const commentApi = `https://www.tikwm.com/api/comment/list/?aweme_id=${videoId}&count=50`;
-            const commentRes = await axios.get(commentApi, { timeout: 15000 });
-            const comments = commentRes.data?.data?.comments || [];
+            const commentRes = await fetch(commentApi);
+            const commentJson = await commentRes.json();
+            const comments = commentJson.data?.comments || [];
 
-            // Fungsi untuk memproses satu objek komentar
             const processComment = (c) => {
                const text = c.text || '';
                const cUid = c.user?.uid;
@@ -78,14 +83,16 @@ export default async function handler(req, res) {
                // A. Pindai komentar utama
                processComment(c);
 
-               // B. Pindai BALASAN (nested replies) di dalam komentar tersebut
+               // B. Pindai BALASAN (nested replies)
                if (c.reply_comment && Array.isArray(c.reply_comment)) {
                   c.reply_comment.forEach(reply => {
                      processComment(reply);
                   });
                }
             });
-         } catch (e) {}
+         } catch (e) {
+            console.log('Gagal scraping komentar:', e.message);
+         }
       }
 
       const uniquePresets = Array.from(new Map(allPresets.map(p => [p.url, p])).values());
@@ -103,5 +110,5 @@ export default async function handler(req, res) {
    } catch (error) {
       return res.status(500).json({ success: false, error: error.message });
    }
-      }
+                  }
                
