@@ -19,21 +19,15 @@ export default async function handler(req, res) {
             const expandRes = await axios.get(inputUrl, {
                maxRedirects: 5,
                validateStatus: s => s >= 200 && s < 400,
-               headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0' }
+               headers: { 'User-Agent': 'Mozilla/5.0' }
             });
             const resolved = expandRes.request?.res?.responseUrl || expandRes.config?.url || inputUrl;
             longUrl = resolved.split('?')[0]; 
-         } catch (e) {
-            console.log('Gagal expand URL:', e.message);
-         }
+         } catch (e) {}
       }
 
       const videoIdMatch = longUrl.match(/video\/(\d+)/);
       const videoId = videoIdMatch ? videoIdMatch[1] : '';
-
-      if (!videoId) {
-         return res.status(400).json({ success: false, message: 'Gagal mendeteksi ID Video dari URL.' });
-      }
 
       // 2. AMBIL DATA VIDEO (Untuk Judul & ID Author)
       const tikwmUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(longUrl)}`;
@@ -44,46 +38,43 @@ export default async function handler(req, res) {
 
       let allPresets = [];
 
-      // Helper untuk ekstrak dan filter link
+      // HELPER: Sapu bersih SEMUA link awalan https:// (Sesuai saran Anda)
       const extractLinks = (text, defaultSource, authorName) => {
          if (!text) return;
+         // Regex murni mencari string awalan http atau https
          const urls = text.match(/(https?:\/\/[^\s"'<>]+)/g) || [];
          urls.forEach(u => {
-            const cleanUrl = u.replace(/['",;\\}]+$/, '');
-            // Filter hanya domain yang relevan dengan Alight Motion / Preset
-            if (cleanUrl.match(/alight\.link|alightcreative\.com|drive\.google\.com|pastebin\.com|mediafire\.com|mega\.nz|xml/i)) {
-               allPresets.push({
-                  url: cleanUrl,
-                  source: defaultSource,
-                  author: authorName
-               });
-            }
+            const cleanUrl = u.replace(/['",;\\}\n\r]+$/, ''); // Bersihkan karakter sisa di ujung
+            allPresets.push({
+               url: cleanUrl,
+               source: defaultSource,
+               author: authorName
+            });
          });
       };
 
       // 3. EKSTRAK DARI DESKRIPSI VIDEO
       extractLinks(videoData.title, 'description', `@${authorHandle} (Kreator)`);
 
-      // 4. SCRAPING KOMENTAR LANGSUNG (Maksimal 50 komentar teratas)
-      try {
-         const commentApi = `https://www.tikwm.com/api/comment/list/?aweme_id=${videoId}&count=50`;
-         const commentRes = await axios.get(commentApi, { timeout: 15000 });
-         const comments = commentRes.data?.data?.comments || [];
+      // 4. SCRAPING KOMENTAR LANGSUNG
+      if (videoId) {
+         try {
+            const commentApi = `https://www.tikwm.com/api/comment/list/?aweme_id=${videoId}&count=50`;
+            const commentRes = await axios.get(commentApi, { timeout: 15000 });
+            const comments = commentRes.data?.data?.comments || [];
 
-         comments.forEach(c => {
-            const text = c.text || '';
-            const cUid = c.user?.uid;
-            const cUsername = c.user?.unique_id || 'Komentar';
-            
-            // Cek apakah komentar ini dari author asli atau ada kata "pencipta"
-            const isCreator = (cUid === authorId) || text.toLowerCase().includes('pencipta');
-            const source = isCreator ? 'description' : 'comments'; // Paksa masuk kategori 'description' (Kreator) di bot
-            const authorLabel = `@${cUsername}${isCreator ? ' (Kreator)' : ''}`;
+            comments.forEach(c => {
+               const text = c.text || '';
+               const cUid = c.user?.uid;
+               const cUsername = c.user?.unique_id || 'Komentar';
+               
+               const isCreator = (cUid === authorId) || text.toLowerCase().includes('pencipta');
+               const source = isCreator ? 'description' : 'comments'; 
+               const authorLabel = `@${cUsername}${isCreator ? ' (Kreator)' : ''}`;
 
-            extractLinks(text, source, authorLabel);
-         });
-      } catch (e) {
-         console.log('Gagal scraping komentar:', e.message);
+               extractLinks(text, source, authorLabel);
+            });
+         } catch (e) {}
       }
 
       // Hapus Duplikat Link
@@ -102,5 +93,5 @@ export default async function handler(req, res) {
    } catch (error) {
       return res.status(500).json({ success: false, error: error.message });
    }
-      }
-   
+               }
+         
