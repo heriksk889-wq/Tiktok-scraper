@@ -11,7 +11,7 @@ export default async function handler(req, res) {
    try {
       let longUrl = inputUrl;
       
-      // 1. AUTO-EXPAND SHORTLINK
+      // 1. Auto-expand shortlink
       if (inputUrl.includes('vt.tiktok.com') || inputUrl.includes('vm.tiktok.com')) {
          try {
             const expandRes = await fetch(inputUrl, {
@@ -22,29 +22,26 @@ export default async function handler(req, res) {
          } catch (e) {}
       }
 
-      const videoIdMatch = longUrl.match(/video\/(\d+)/);
-      const videoId = videoIdMatch ? videoIdMatch[1] : '';
+      // 2. Ambil data video DAN komentar sekaligus via TikWM endpoint utama (&comment=1)
+      const tikwmUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(longUrl)}&comment=1`;
+      const tikwmRes = await fetch(tikwmUrl);
+      const tikwmJson = await tikwmRes.json();
+      
+      if (!tikwmJson || tikwmJson.code !== 0 || !tikwmJson.data) {
+         return res.status(404).json({ success: false, message: 'Gagal mengambil data dari TikTok.' });
+      }
 
-      // 2. AMBIL DATA VIDEO
-      let videoData = {};
-      let authorId = '';
-      let authorHandle = 'Kreator';
-
-      try {
-         const tikwmUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(longUrl)}`;
-         const tikwmRes = await fetch(tikwmUrl);
-         const tikwmJson = await tikwmRes.json();
-         videoData = tikwmJson.data || {};
-         authorId = videoData.author?.id || '';
-         authorHandle = videoData.author?.unique_id || 'Kreator';
-      } catch (e) {}
+      const videoData = tikwmJson.data;
+      const authorHandle = videoData.author?.unique_id || 'Kreator';
+      const authorId = videoData.author?.id || '';
+      const description = videoData.title || '';
+      const comments = videoData.comments_list || [];
 
       let allPresets = [];
-      let rawCommentsDump = []; // Menyimpan semua teks komentar mentah untuk didiagnosis
 
+      // Helper sapu bersih link awalan http/https
       const extractLinks = (text, defaultSource, authorName) => {
          if (!text) return;
-         // Tangkap semua jenis link atau teks yang menyerupai URL
          const urls = text.match(/(https?:\/\/[^\s"'<>]+)/g) || [];
          urls.forEach(u => {
             const cleanUrl = u.replace(/['",;\\}\n\r]+$/, ''); 
@@ -56,53 +53,42 @@ export default async function handler(req, res) {
          });
       };
 
-      extractLinks(videoData.title, 'description', `@${authorHandle} (Kreator)`);
+      // Cek deskripsi video
+      extractLinks(description, 'description', `@${authorHandle} (Kreator)`);
 
-      // 3. AMBIL SEMUA KOMENTAR MENTAH
-      if (videoId) {
-         try {
-            const commentApi = `https://www.tikwm.com/api/comment/list/?aweme_id=${videoId}&count=50`;
-            const commentRes = await fetch(commentApi);
-            const commentJson = await commentRes.json();
-            const comments = commentJson.data?.comments || [];
+      // Cek komentar utama & balasan (nested replies) dari TikWM
+      comments.forEach(c => {
+         const text = c.text || '';
+         const cUid = c.user?.uid;
+         const cUsername = c.user?.unique_id || c.user?.nickname || 'Komentar';
+         
+         const isCreator = (cUid === authorId) || text.toLowerCase().includes('pencipta') || cUsername.toLowerCase() === authorHandle.toLowerCase();
+         const source = isCreator ? 'description' : 'comments'; 
+         const authorLabel = `@${cUsername}${isCreator ? ' (Kreator)' : ''}`;
 
-            const processComment = (c, isReply = false) => {
-               const text = c.text || '';
-               const cUid = c.user?.uid;
-               const cUsername = c.user?.unique_id || c.user?.nickname || 'Komentar';
+         extractLinks(text, source, authorLabel);
+
+         // Pindai balasan komentar (replies)
+         if (c.reply_comment && Array.isArray(c.reply_comment)) {
+            c.reply_comment.forEach(reply => {
+               const rText = reply.text || '';
+               const rUid = reply.user?.uid;
+               const rUsername = reply.user?.unique_id || reply.user?.nickname || 'Komentar';
+               const isRCreator = (rUid === authorId) || rText.toLowerCase().includes('pencipta') || rUsername.toLowerCase() === authorHandle.toLowerCase();
+               const rSource = isRCreator ? 'description' : 'comments';
+               const rAuthorLabel = `@${rUsername}${isRCreator ? ' (Kreator)' : ''}`;
                
-               // Masukkan ke log mentah untuk diteliti
-               rawCommentsDump.push({
-                  author: cUsername,
-                  text: text,
-                  is_reply: isReply
-               });
-
-               const isCreator = (cUid === authorId) || text.toLowerCase().includes('pencipta');
-               const source = isCreator ? 'description' : 'comments'; 
-               const authorLabel = `@${cUsername}${isCreator ? ' (Kreator)' : ''}`;
-
-               extractLinks(text, source, authorLabel);
-            };
-
-            comments.forEach(c => {
-               processComment(c, false);
-               if (c.reply_comment && Array.isArray(c.reply_comment)) {
-                  c.reply_comment.forEach(reply => {
-                     processComment(reply, true);
-                  });
-               }
+               extractLinks(rText, rSource, rAuthorLabel);
             });
-         } catch (e) {}
-      }
+         }
+      });
 
       const uniquePresets = Array.from(new Map(allPresets.map(p => [p.url, p])).values());
 
       return res.status(200).json({
          success: true,
-         debug_raw_comments: rawCommentsDump, // Menampilkan seluruh teks komentar mentah ke konsol bot
          video: {
-            title: videoData.title || '',
+            title: description,
             play: videoData.play || '',
             author: authorHandle
          },
@@ -113,4 +99,4 @@ export default async function handler(req, res) {
       return res.status(500).json({ success: false, error: error.message });
    }
                }
-                   
+               
