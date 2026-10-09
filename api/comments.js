@@ -14,67 +14,96 @@ export default async function handler(req, res) {
    }
 
    try {
-      const tikwmUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(targetUrl)}&comment=1`;
-      
-      const response = await axios.get(tikwmUrl, {
+      // 1. Ambil data video & play URL via tikwm
+      const tikwmUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(targetUrl)}`;
+      const tikwmRes = await axios.get(tikwmUrl, { timeout: 15000 });
+      const videoData = tikwmRes.data?.data || {};
+
+      // 2. Ambil data preset dari amfinder API langsung dari server Vercel (IP bersih)
+      const params = new URLSearchParams();
+      params.append('query', targetUrl);
+      params.append('q', targetUrl);
+
+      const amfinderUrl = `https://amfinder.web.id/api/search?${params.toString()}`;
+      const amfinderRes = await axios.get(amfinderUrl, {
          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://amfinder.web.id/',
+            'Accept': 'text/event-stream, application/json'
          },
-         timeout: 15000
+         timeout: 30000
       });
 
-      const data = response.data;
-      if (!data || data.code !== 0) {
-         return res.status(404).json({ success: false, message: 'Gagal mengambil data dari TikTok.' });
-      }
-
-      const videoInfo = data.data;
-      const authorName = videoInfo.author?.unique_id || videoInfo.author?.nickname || 'Kreator';
-      const description = videoInfo.title || '';
-      const comments = videoInfo.comments_list || [];
-
+      const rawText = typeof amfinderRes.data === 'string' ? amfinderRes.data : JSON.stringify(amfinderRes.data);
+      const lines = rawText.split('\n');
       let allPresets = [];
 
-      // Deteksi link dari Deskripsi Video
-      const descMatches = description.match(/(https?:\/\/[^\s"'<>]+)/g) || [];
-      descMatches.forEach(url => {
-         const cleanUrl = url.replace(/['",;\\}]+$/, '');
-         if (isPresetLink(cleanUrl)) {
-            allPresets.push({
-               url: cleanUrl,
-               source: 'description',
-               author: `@${authorName} (Kreator)`
-            });
+      // Parsing struktur event stream dari amfinder
+      for (const line of lines) {
+         if (line.startsWith('data:')) {
+            try {
+               const jsonStr = line.replace('data:', '').trim();
+               const parsed = JSON.parse(jsonStr);
+
+               const videoList = parsed.videos || (parsed.presetLinks ? [parsed] : null);
+               if (videoList && Array.isArray(videoList)) {
+                  videoList.forEach(video => {
+                     if (video.presetLinks && Array.isArray(video.presetLinks)) {
+                        video.presetLinks.forEach(item => {
+                           if (typeof item === 'object' && item.url) {
+                              allPresets.push({
+                                 url: item.url,
+                                 source: item.source || 'comments',
+                                 author: item.author || video.handle || 'Komentar'
+                              });
+                           } else if (typeof item === 'string') {
+                              allPresets.push({
+                                 url: item,
+                                 source: 'comments',
+                                 author: 'Komentar'
+                              });
+                           }
+                        });
+                     }
+                  });
+               }
+            } catch (e) {}
          }
-      });
+      }
 
-      // Deteksi link dari Kolom Komentar
-      comments.forEach(comment => {
-         const commentText = comment.text || '';
-         const commentAuthor = comment.user?.unique_id || comment.user?.nickname || 'Pengguna';
-         const isCreatorComment = comment.user?.uid === videoInfo.author?.id || commentText.toLowerCase().includes('pencipta');
+      // Fallback Universal Regex Scanner jika terstruktur kosong
+      if (allPresets.length === 0) {
+         const cleanedText = rawText.replace(/\\/g, '');
+         const urlRegex = /(https?:\/\/[^\s"'<>]+)/g;
+         const foundUrls = cleanedText.match(urlRegex) || [];
+         
+         const filteredUrls = foundUrls.filter(url => 
+            url.includes('alight.link') || 
+            url.includes('alightcreative.com') || 
+            url.includes('drive.google.com') || 
+            url.includes('pastebin.com') || 
+            url.includes('mediafire.com') ||
+            url.includes('mega.nz') ||
+            url.toLowerCase().includes('xml')
+         );
 
-         const commentMatches = commentText.match(/(https?:\/\/[^\s"'<>]+)/g) || [];
-         commentMatches.forEach(url => {
-            const cleanUrl = url.replace(/['",;\\}]+$/, '');
-            if (isPresetLink(cleanUrl)) {
-               allPresets.push({
-                  url: cleanUrl,
-                  source: isCreatorComment ? 'description' : 'comments',
-                  author: `@${commentAuthor}${isCreatorComment ? ' (Kreator)' : ''}`
-               });
-            }
+         filteredUrls.forEach(url => {
+            allPresets.push({
+               url: url.replace(/['",;\\}]+$/, ''),
+               source: 'comments',
+               author: 'Kreator / Komentar'
+            });
          });
-      });
+      }
 
       const uniquePresets = Array.from(new Map(allPresets.map(p => [p.url, p])).values());
 
       return res.status(200).json({
          success: true,
          video: {
-            title: description,
-            play: videoInfo.play,
-            author: authorName
+            title: videoData.title || '',
+            play: videoData.play || '',
+            author: videoData.author?.unique_id || ''
          },
          presets: uniquePresets
       });
@@ -86,17 +115,4 @@ export default async function handler(req, res) {
       });
    }
 }
-
-function isPresetLink(url) {
-   const lower = url.toLowerCase();
-   return (
-      lower.includes('alight.link') ||
-      lower.includes('alightcreative.com') ||
-      lower.includes('drive.google.com') ||
-      lower.includes('pastebin.com') ||
-      lower.includes('mediafire.com') ||
-      lower.includes('mega.nz') ||
-      lower.toLowerCase().includes('xml')
-   );
-        }
-     
+   
