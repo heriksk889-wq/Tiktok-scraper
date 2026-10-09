@@ -11,7 +11,7 @@ export default async function handler(req, res) {
    try {
       let longUrl = inputUrl;
       
-      // 1. Auto-expand shortlink
+      // 1. Auto-expand shortlink agar jadi URL panjang asli
       if (inputUrl.includes('vt.tiktok.com') || inputUrl.includes('vm.tiktok.com')) {
          try {
             const expandRes = await fetch(inputUrl, {
@@ -22,75 +22,92 @@ export default async function handler(req, res) {
          } catch (e) {}
       }
 
-      // 2. Ambil data video DAN komentar sekaligus via TikWM endpoint utama (&comment=1)
-      const tikwmUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(longUrl)}&comment=1`;
-      const tikwmRes = await fetch(tikwmUrl);
-      const tikwmJson = await tikwmRes.json();
-      
-      if (!tikwmJson || tikwmJson.code !== 0 || !tikwmJson.data) {
-         return res.status(404).json({ success: false, message: 'Gagal mengambil data dari TikTok.' });
-      }
+      // Ambil ID Video untuk pencocokan ketat
+      const videoIdMatch = longUrl.match(/video\/(\d+)/);
+      const videoId = videoIdMatch ? videoIdMatch[1] : '';
 
-      const videoData = tikwmJson.data;
-      const authorHandle = videoData.author?.unique_id || 'Kreator';
-      const authorId = videoData.author?.id || '';
-      const description = videoData.title || '';
-      const comments = videoData.comments_list || [];
+      // 2. Ambil data video dasar via TikWM (hanya untuk judul & author)
+      let videoData = {};
+      try {
+         const tikwmRes = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(longUrl)}`);
+         const tikwmJson = await tikwmRes.json();
+         videoData = tikwmJson.data || {};
+      } catch (e) {}
 
       let allPresets = [];
 
-      // Helper sapu bersih link awalan http/https
-      const extractLinks = (text, defaultSource, authorName) => {
-         if (!text) return;
-         const urls = text.match(/(https?:\/\/[^\s"'<>]+)/g) || [];
-         urls.forEach(u => {
-            const cleanUrl = u.replace(/['",;\\}\n\r]+$/, ''); 
-            allPresets.push({
-               url: cleanUrl,
-               source: defaultSource,
-               author: authorName
-            });
+      // 3. Tembak Amfinder dengan URL panjang yang sudah bersih
+      try {
+         const amfinderUrl = `https://amfinder.web.id/api/search?query=${encodeURIComponent(longUrl)}&q=${encodeURIComponent(longUrl)}`;
+         const amfinderRes = await fetch(amfinderUrl, {
+            headers: {
+               'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+               'Referer': 'https://amfinder.web.id/',
+               'Accept': 'text/event-stream, application/json'
+            }
          });
-      };
 
-      // Cek deskripsi video
-      extractLinks(description, 'description', `@${authorHandle} (Kreator)`);
+         const rawText = await amfinderRes.text();
+         const lines = rawText.split('\n');
 
-      // Cek komentar utama & balasan (nested replies) dari TikWM
-      comments.forEach(c => {
-         const text = c.text || '';
-         const cUid = c.user?.uid;
-         const cUsername = c.user?.unique_id || c.user?.nickname || 'Komentar';
-         
-         const isCreator = (cUid === authorId) || text.toLowerCase().includes('pencipta') || cUsername.toLowerCase() === authorHandle.toLowerCase();
-         const source = isCreator ? 'description' : 'comments'; 
-         const authorLabel = `@${cUsername}${isCreator ? ' (Kreator)' : ''}`;
+         for (const line of lines) {
+            if (line.startsWith('data:')) {
+               try {
+                  const parsed = JSON.parse(line.replace('data:', '').trim());
+                  const videoList = parsed.videos || (parsed.presetLinks ? [parsed] : null);
 
-         extractLinks(text, source, authorLabel);
+                  if (videoList && Array.isArray(videoList)) {
+                     // STRICT MATCHING: Cari video yang URL atau ID-nya benar-benar sama persis
+                     const targetVideo = videoId 
+                        ? videoList.find(v => v.url && v.url.includes(videoId)) 
+                        : null;
 
-         // Pindai balasan komentar (replies)
-         if (c.reply_comment && Array.isArray(c.reply_comment)) {
-            c.reply_comment.forEach(reply => {
-               const rText = reply.text || '';
-               const rUid = reply.user?.uid;
-               const rUsername = reply.user?.unique_id || reply.user?.nickname || 'Komentar';
-               const isRCreator = (rUid === authorId) || rText.toLowerCase().includes('pencipta') || rUsername.toLowerCase() === authorHandle.toLowerCase();
-               const rSource = isRCreator ? 'description' : 'comments';
-               const rAuthorLabel = `@${rUsername}${isRCreator ? ' (Kreator)' : ''}`;
-               
-               extractLinks(rText, rSource, rAuthorLabel);
-            });
+                     // Jika ketemu video yang pas, ambil presetLinks-nya
+                     if (targetVideo && targetVideo.presetLinks && Array.isArray(targetVideo.presetLinks)) {
+                        targetVideo.presetLinks.forEach(item => {
+                           const pUrl = typeof item === 'object' ? item.url : item;
+                           const pAuthor = typeof item === 'object' ? (item.author || targetVideo.handle || 'Komentar') : 'Komentar';
+                           
+                           if (pUrl) {
+                              allPresets.push({
+                                 url: pUrl.replace(/['",;\\}\n\r\)]+$/, ''),
+                                 source: 'comments',
+                                 author: pAuthor
+                              });
+                           }
+                        });
+                        break; // Berhenti karena video target sudah ketemu
+                     }
+                  }
+               } catch (err) {}
+            }
          }
-      });
+      } catch (e) {}
 
+      // Fallback Regex Universal jika event stream amfinder kosong
+      if (allPresets.length === 0) {
+         const urls = rawText.match(/(https?:\/\/[^\s"'<>]+)/g) || [];
+         urls.forEach(u => {
+            const cleanUrl = u.replace(/['",;\\}\n\r\)]+$/, '');
+            if (!cleanUrl.includes('tiktok.com') && !cleanUrl.includes('byteimg.com')) {
+               allPresets.push({
+                  url: cleanUrl,
+                  source: 'comments',
+                  author: 'Kreator / Komentar'
+               });
+            }
+         });
+      }
+
+      // Hapus duplikat link
       const uniquePresets = Array.from(new Map(allPresets.map(p => [p.url, p])).values());
 
       return res.status(200).json({
          success: true,
          video: {
-            title: description,
+            title: videoData.title || '',
             play: videoData.play || '',
-            author: authorHandle
+            author: videoData.author?.unique_id || ''
          },
          presets: uniquePresets
       });
@@ -98,5 +115,5 @@ export default async function handler(req, res) {
    } catch (error) {
       return res.status(500).json({ success: false, error: error.message });
    }
-               }
-               
+            }
+         
