@@ -7,23 +7,20 @@ export default async function handler(req, res) {
    const inputUrl = req.query.url || req.query.query;
 
    if (!inputUrl || !inputUrl.includes('tiktok.com')) {
-      return res.status(400).json({ 
-         success: false, 
-         message: 'URL TikTok tidak valid atau kosong.' 
-      });
+      return res.status(400).json({ success: false, message: 'URL TikTok tidak valid.' });
    }
 
    try {
       let longUrl = inputUrl;
-      let targetVideoId = '';
+      let videoId = '';
 
-      // 1. AUTO-EXPAND SHORTLINK (Wajib agar amfinder tidak nyasar)
+      // 1. AUTO-EXPAND SHORTLINK
       if (inputUrl.includes('vt.tiktok.com') || inputUrl.includes('vm.tiktok.com')) {
          try {
             const expandRes = await axios.get(inputUrl, {
                maxRedirects: 5,
-               validateStatus: status => status >= 200 && status < 400,
-               headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0' }
+               validateStatus: s => s >= 200 && s < 400,
+               headers: { 'User-Agent': 'Mozilla/5.0' }
             });
             const resolved = expandRes.request?.res?.responseUrl || expandRes.config?.url || inputUrl;
             longUrl = resolved.split('?')[0]; 
@@ -32,94 +29,98 @@ export default async function handler(req, res) {
          }
       }
 
-      // Ambil ID Video untuk pencocokan akurat
-      const idMatch = longUrl.match(/video\/(\d+)/);
-      if (idMatch) targetVideoId = idMatch[1];
+      // Ambil ID Video
+      videoId = longUrl.match(/video\/(\d+)/)?.[1] || '';
 
-      // 2. Ambil data video via tikwm
+      // 2. AMBIL DATA VIDEO (Untuk Deskripsi & Author)
       const tikwmUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(longUrl)}`;
       const tikwmRes = await axios.get(tikwmUrl, { timeout: 15000 }).catch(() => ({}));
       const videoData = tikwmRes.data?.data || {};
+      
+      if (!videoId && videoData.id) videoId = videoData.id;
 
-      // 3. Ambil data preset dari amfinder menggunakan URL Panjang
-      const params = new URLSearchParams();
-      params.append('query', longUrl);
-      params.append('q', longUrl);
-
-      const amfinderUrl = `https://amfinder.web.id/api/search?${params.toString()}`;
-      const amfinderRes = await axios.get(amfinderUrl, {
-         headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Referer': 'https://amfinder.web.id/',
-            'Accept': 'text/event-stream, application/json'
-         },
-         timeout: 30000
-      });
-
-      const rawText = typeof amfinderRes.data === 'string' ? amfinderRes.data : JSON.stringify(amfinderRes.data);
-      const lines = rawText.split('\n');
       let allPresets = [];
-      let isTargetFound = false;
 
-      // Parsing struktur event stream dari amfinder (HANYA TARGET VIDEO)
-      for (const line of lines) {
-         if (line.startsWith('data:')) {
-            try {
-               const jsonStr = line.replace('data:', '').trim();
-               const parsed = JSON.parse(jsonStr);
+      // 3. EKSTRAK DARI DESKRIPSI VIDEO (Kreator Asli)
+      const descText = videoData.title || '';
+      const authorHandle = videoData.author?.unique_id || 'Kreator';
+      extractPresets(descText, 'description', `@${authorHandle} (Kreator)`, allPresets);
 
-               const videoList = parsed.videos || (parsed.presetLinks ? [parsed] : null);
+      // 4. SCRAPING KOMENTAR TIKTOK LANGSUNG
+      if (videoId) {
+         try {
+            // Mengakses endpoint API komentar secara langsung untuk ID video ini
+            const commentApiUrl = `https://www.tikwm.com/api/comment/list/?aweme_id=${videoId}&count=50`;
+            const commentRes = await axios.get(commentApiUrl, { timeout: 15000 });
+            const comments = commentRes.data?.data?.comments || [];
+
+            // Pindai setiap baris komentar
+            comments.forEach(c => {
+               const text = c.text || '';
+               const commenter = c.user?.unique_id || 'Komentar';
                
-               if (videoList && Array.isArray(videoList) && videoList.length > 0) {
-                  // Filter HANYA video yang ID-nya cocok dengan URL yang diminta
-                  const mainVideo = targetVideoId 
-                     ? videoList.find(v => v.url && v.url.includes(targetVideoId)) || videoList[0]
-                     : videoList[0];
-
-                  if (mainVideo && mainVideo.presetLinks && Array.isArray(mainVideo.presetLinks)) {
-                     mainVideo.presetLinks.forEach(item => {
-                        if (typeof item === 'object' && item.url) {
-                           allPresets.push({
-                              url: item.url,
-                              source: item.source || 'comments',
-                              author: item.author || mainVideo.handle || 'Komentar'
-                           });
-                        } else if (typeof item === 'string') {
-                           allPresets.push({
-                              url: item,
-                              source: 'comments',
-                              author: 'Komentar'
-                           });
-                        }
-                     });
-                     isTargetFound = true;
-                     break; // HENTIKAN LOOP! Jangan ambil data dari video orang lain
-                  }
-               }
-            } catch (e) {}
+               // Cek apakah yang berkomentar adalah kreator video itu sendiri
+               const isCreator = (c.user?.uid === videoData.author?.id) || text.toLowerCase().includes('pencipta');
+               
+               extractPresets(text, isCreator ? 'description' : 'comments', `@${commenter}${isCreator ? ' (Kreator)' : ''}`, allPresets);
+            });
+         } catch (e) {
+            console.log('Gagal fetch komentar:', e.message);
          }
-         if (isTargetFound) break; // Keluar dari parsing jika target sudah ketemu
       }
 
-      // Hapus duplikat link
+      // 5. FALLBACK TERAKHIR KE AMFINDER (Gunakan Video ID agar tidak mencari video acak)
+      if (allPresets.length === 0 && videoId) {
+         try {
+            const amfinderRes = await axios.get(`https://amfinder.web.id/api/search?query=${videoId}&q=${videoId}`, {
+               headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 20000
+            });
+            const rawText = typeof amfinderRes.data === 'string' ? amfinderRes.data : JSON.stringify(amfinderRes.data);
+            extractPresets(rawText, 'comments', 'Kreator / Komentar', allPresets);
+         } catch (e) {}
+      }
+
+      // Hapus Duplikat URL
       const uniquePresets = Array.from(new Map(allPresets.map(p => [p.url, p])).values());
 
       return res.status(200).json({
          success: true,
          debug_url: longUrl,
          video: {
-            title: videoData.title || '',
+            title: descText,
             play: videoData.play || '',
-            author: videoData.author?.unique_id || ''
+            author: authorHandle
          },
          presets: uniquePresets
       });
 
    } catch (error) {
-      return res.status(500).json({ 
-         success: false, 
-         error: error.message 
-      });
+      return res.status(500).json({ success: false, error: error.message });
    }
+}
+
+// Fungsi Pengekstrak Tautan
+function extractPresets(text, source, author, arrayTarget) {
+   const cleanedText = text.replace(/\\/g, '');
+   const urlRegex = /(https?:\/\/[^\s"'<>]+)/g;
+   const foundUrls = cleanedText.match(urlRegex) || [];
+   
+   const filteredUrls = foundUrls.filter(url => 
+      url.includes('alight.link') || 
+      url.includes('alightcreative.com') || 
+      url.includes('drive.google.com') || 
+      url.includes('pastebin.com') || 
+      url.includes('mediafire.com') ||
+      url.includes('mega.nz') ||
+      url.toLowerCase().includes('xml')
+   );
+
+   filteredUrls.forEach(url => {
+      arrayTarget.push({
+         url: url.replace(/['",;\\}]+$/, ''),
+         source: source,
+         author: author
+      });
+   });
                }
-                    
+         
