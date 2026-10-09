@@ -38,7 +38,7 @@ export default async function handler(req, res) {
       let allPresets = [];
       let videoTitle = '';
 
-      // 3. Ambil judul/deskripsi video dari struktur SIGI_STATE jika tersedia
+      // 3. Ambil judul/deskripsi video dari struktur SIGI_STATE
       try {
          const sigiMatch = htmlText.match(/<script id="SIGI_STATE" type="application\/json">([\s\S]*?)<\/script>/);
          if (sigiMatch && sigiMatch[1]) {
@@ -52,25 +52,25 @@ export default async function handler(req, res) {
          }
       } catch (e) {}
 
-      // 4. Universal HTML Regex Scraper (Sapu bersih seluruh link http/https di halaman)
-      // Karena halaman SSR TikTok memuat teks komentar & deskripsi di dalam HTML, cara ini sangat ampuh menangkap link tersembunyi.
+      // 4. Regex pencari link dengan WHITELIST KETAT
       const urlRegex = /(https?:\/\/[^\s"'<>]+)/g;
       const rawMatches = htmlText.match(urlRegex) || [];
 
       rawMatches.forEach(u => {
          let cleanUrl = u.replace(/['",;\\}\n\r\)]+$/, '').replace(/&amp;/g, '&');
          
-         // Filter domain internal TikTok / sampah agar tidak ikut tersedot
-         if (
-            cleanUrl &&
-            !cleanUrl.includes('tiktok.com') &&
-            !cleanUrl.includes('byteimg.com') &&
-            !cleanUrl.includes('akamaized.net') &&
-            !cleanUrl.includes('musical.ly') &&
-            !cleanUrl.includes('bytedance') &&
-            !cleanUrl.includes('w3.org') &&
-            !cleanUrl.includes('schema.org')
-         ) {
+         // HANYA AMBIL LINK PRESET / DOWNLOAD / SALURAN YANG VALID
+         const isPresetLink = 
+            cleanUrl.includes('alight.link') ||
+            cleanUrl.includes('alightcreative.com') ||
+            cleanUrl.includes('drive.google.com') ||
+            cleanUrl.includes('mediafire.com') ||
+            cleanUrl.includes('mega.nz') ||
+            cleanUrl.includes('pastebin.com') ||
+            cleanUrl.includes('whatsapp.com/channel') ||
+            cleanUrl.toLowerCase().includes('xml');
+
+         if (isPresetLink) {
             allPresets.push({
                url: cleanUrl,
                source: 'comments',
@@ -79,7 +79,7 @@ export default async function handler(req, res) {
          }
       });
 
-      // Hapus duplikat URL yang sama
+      // Hapus duplikat URL
       const uniquePresets = Array.from(new Map(allPresets.map(p => [p.url, p])).values());
 
       return res.status(200).json({
@@ -96,3 +96,4 @@ export default async function handler(req, res) {
       return res.status(500).json({ success: false, error: error.message });
    }
 }
+   
