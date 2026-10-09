@@ -11,7 +11,7 @@ export default async function handler(req, res) {
    try {
       let longUrl = inputUrl;
       
-      // 1. AUTO-EXPAND SHORTLINK (Menggunakan native fetch)
+      // 1. AUTO-EXPAND SHORTLINK
       if (inputUrl.includes('vt.tiktok.com') || inputUrl.includes('vm.tiktok.com')) {
          try {
             const expandRes = await fetch(inputUrl, {
@@ -19,15 +19,13 @@ export default async function handler(req, res) {
                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0' }
             });
             longUrl = expandRes.url.split('?')[0]; 
-         } catch (e) {
-            console.log('Gagal expand URL:', e.message);
-         }
+         } catch (e) {}
       }
 
       const videoIdMatch = longUrl.match(/video\/(\d+)/);
       const videoId = videoIdMatch ? videoIdMatch[1] : '';
 
-      // 2. AMBIL DATA VIDEO (Untuk Judul & ID Author)
+      // 2. AMBIL DATA VIDEO
       let videoData = {};
       let authorId = '';
       let authorHandle = 'Kreator';
@@ -42,10 +40,11 @@ export default async function handler(req, res) {
       } catch (e) {}
 
       let allPresets = [];
+      let rawCommentsDump = []; // Menyimpan semua teks komentar mentah untuk didiagnosis
 
-      // Fungsi Helper Sapu Bersih Link (Awalan http/https)
       const extractLinks = (text, defaultSource, authorName) => {
          if (!text) return;
+         // Tangkap semua jenis link atau teks yang menyerupai URL
          const urls = text.match(/(https?:\/\/[^\s"'<>]+)/g) || [];
          urls.forEach(u => {
             const cleanUrl = u.replace(/['",;\\}\n\r]+$/, ''); 
@@ -59,7 +58,7 @@ export default async function handler(req, res) {
 
       extractLinks(videoData.title, 'description', `@${authorHandle} (Kreator)`);
 
-      // 3. SCRAPING KOMENTAR & BALASANNYA
+      // 3. AMBIL SEMUA KOMENTAR MENTAH
       if (videoId) {
          try {
             const commentApi = `https://www.tikwm.com/api/comment/list/?aweme_id=${videoId}&count=50`;
@@ -67,11 +66,18 @@ export default async function handler(req, res) {
             const commentJson = await commentRes.json();
             const comments = commentJson.data?.comments || [];
 
-            const processComment = (c) => {
+            const processComment = (c, isReply = false) => {
                const text = c.text || '';
                const cUid = c.user?.uid;
                const cUsername = c.user?.unique_id || c.user?.nickname || 'Komentar';
                
+               // Masukkan ke log mentah untuk diteliti
+               rawCommentsDump.push({
+                  author: cUsername,
+                  text: text,
+                  is_reply: isReply
+               });
+
                const isCreator = (cUid === authorId) || text.toLowerCase().includes('pencipta');
                const source = isCreator ? 'description' : 'comments'; 
                const authorLabel = `@${cUsername}${isCreator ? ' (Kreator)' : ''}`;
@@ -80,25 +86,21 @@ export default async function handler(req, res) {
             };
 
             comments.forEach(c => {
-               // A. Pindai komentar utama
-               processComment(c);
-
-               // B. Pindai BALASAN (nested replies)
+               processComment(c, false);
                if (c.reply_comment && Array.isArray(c.reply_comment)) {
                   c.reply_comment.forEach(reply => {
-                     processComment(reply);
+                     processComment(reply, true);
                   });
                }
             });
-         } catch (e) {
-            console.log('Gagal scraping komentar:', e.message);
-         }
+         } catch (e) {}
       }
 
       const uniquePresets = Array.from(new Map(allPresets.map(p => [p.url, p])).values());
 
       return res.status(200).json({
          success: true,
+         debug_raw_comments: rawCommentsDump, // Menampilkan seluruh teks komentar mentah ke konsol bot
          video: {
             title: videoData.title || '',
             play: videoData.play || '',
@@ -110,5 +112,5 @@ export default async function handler(req, res) {
    } catch (error) {
       return res.status(500).json({ success: false, error: error.message });
    }
-                  }
-               
+               }
+                   
