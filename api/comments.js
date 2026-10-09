@@ -19,110 +19,88 @@ export default async function handler(req, res) {
             const expandRes = await axios.get(inputUrl, {
                maxRedirects: 5,
                validateStatus: s => s >= 200 && s < 400,
-               headers: { 'User-Agent': 'Mozilla/5.0' }
+               headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0' }
             });
             const resolved = expandRes.request?.res?.responseUrl || expandRes.config?.url || inputUrl;
             longUrl = resolved.split('?')[0]; 
-         } catch (e) {}
+         } catch (e) {
+            console.log('Gagal expand URL:', e.message);
+         }
       }
 
-      const videoId = longUrl.match(/video\/(\d+)/)?.[1] || '';
+      const videoIdMatch = longUrl.match(/video\/(\d+)/);
+      const videoId = videoIdMatch ? videoIdMatch[1] : '';
 
-      // 2. AMBIL DATA VIDEO (Mendapatkan ID & Username Kreator yang asli)
+      if (!videoId) {
+         return res.status(400).json({ success: false, message: 'Gagal mendeteksi ID Video dari URL.' });
+      }
+
+      // 2. AMBIL DATA VIDEO (Untuk Judul & ID Author)
       const tikwmUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(longUrl)}`;
       const tikwmRes = await axios.get(tikwmUrl, { timeout: 15000 }).catch(() => ({}));
       const videoData = tikwmRes.data?.data || {};
-      const authorHandle = videoData.author?.unique_id || '';
       const authorId = videoData.author?.id || '';
+      const authorHandle = videoData.author?.unique_id || 'Kreator';
 
       let allPresets = [];
 
-      // Helper pencocokan otomatis: Kalau author komentar == author video, paksa status jadi 'description'
-      const extractAndPush = (text, defaultSource, authorName) => {
+      // Helper untuk ekstrak dan filter link
+      const extractLinks = (text, defaultSource, authorName) => {
+         if (!text) return;
          const urls = text.match(/(https?:\/\/[^\s"'<>]+)/g) || [];
-         const filtered = urls.filter(u => u.match(/alight\.link|alightcreative\.com|drive\.google\.com|pastebin\.com|mediafire\.com|mega\.nz|xml/i));
-         filtered.forEach(u => {
-            const isCreator = defaultSource === 'description' || 
-                              authorName.toLowerCase().includes(authorHandle.toLowerCase()) || 
-                              authorName.toLowerCase().includes('kreator') || 
-                              authorName.toLowerCase().includes('pencipta');
-            
-            allPresets.push({
-               url: u.replace(/['",;\\}]+$/, ''),
-               source: isCreator ? 'description' : 'comments', // 'description' agar masuk kategori Kreator di Bot WA
-               author: authorName
-            });
+         urls.forEach(u => {
+            const cleanUrl = u.replace(/['",;\\}]+$/, '');
+            // Filter hanya domain yang relevan dengan Alight Motion / Preset
+            if (cleanUrl.match(/alight\.link|alightcreative\.com|drive\.google\.com|pastebin\.com|mediafire\.com|mega\.nz|xml/i)) {
+               allPresets.push({
+                  url: cleanUrl,
+                  source: defaultSource,
+                  author: authorName
+               });
+            }
          });
       };
 
-      // 3. CEK DESKRIPSI VIDEO
-      if (videoData.title) extractAndPush(videoData.title, 'description', `@${authorHandle}`);
+      // 3. EKSTRAK DARI DESKRIPSI VIDEO
+      extractLinks(videoData.title, 'description', `@${authorHandle} (Kreator)`);
 
-      // 4. CEK KOMENTAR VIA API LANGSUNG (Akurat 100%)
-      if (videoId) {
-         try {
-            const commentRes = await axios.get(`https://www.tikwm.com/api/comment/list/?aweme_id=${videoId}&count=50`, { timeout: 10000 });
-            const comments = commentRes.data?.data?.comments || [];
-            comments.forEach(c => {
-               const isCreator = (c.user?.uid === authorId) || (c.text || '').toLowerCase().includes('pencipta');
-               const cAuthor = `@${c.user?.unique_id || 'Komentar'}`;
-               extractAndPush(c.text || '', isCreator ? 'description' : 'comments', cAuthor);
-            });
-         } catch (e) {}
+      // 4. SCRAPING KOMENTAR LANGSUNG (Maksimal 50 komentar teratas)
+      try {
+         const commentApi = `https://www.tikwm.com/api/comment/list/?aweme_id=${videoId}&count=50`;
+         const commentRes = await axios.get(commentApi, { timeout: 15000 });
+         const comments = commentRes.data?.data?.comments || [];
+
+         comments.forEach(c => {
+            const text = c.text || '';
+            const cUid = c.user?.uid;
+            const cUsername = c.user?.unique_id || 'Komentar';
+            
+            // Cek apakah komentar ini dari author asli atau ada kata "pencipta"
+            const isCreator = (cUid === authorId) || text.toLowerCase().includes('pencipta');
+            const source = isCreator ? 'description' : 'comments'; // Paksa masuk kategori 'description' (Kreator) di bot
+            const authorLabel = `@${cUsername}${isCreator ? ' (Kreator)' : ''}`;
+
+            extractLinks(text, source, authorLabel);
+         });
+      } catch (e) {
+         console.log('Gagal scraping komentar:', e.message);
       }
 
-      // 5. CEK AMFINDER SEBAGAI BACKUP
-      try {
-         const params = new URLSearchParams();
-         params.append('query', longUrl); // WAJIB longUrl, jangan pakai videoId
-         params.append('q', longUrl);
-         
-         const amfinderRes = await axios.get(`https://amfinder.web.id/api/search?${params.toString()}`, {
-            headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/event-stream' }, timeout: 15000
-         });
-         
-         const lines = (typeof amfinderRes.data === 'string' ? amfinderRes.data : JSON.stringify(amfinderRes.data)).split('\n');
-         for (const line of lines) {
-            if (line.startsWith('data:')) {
-               try {
-                  const parsed = JSON.parse(line.replace('data:', '').trim());
-                  const videoList = parsed.videos || (parsed.presetLinks ? [parsed] : null);
-                  
-                  if (videoList && Array.isArray(videoList)) {
-                     // Cari video yang benar-benar cocok dengan yang kita inginkan
-                     const mainVideo = videoId ? videoList.find(v => v.url && v.url.includes(videoId)) : videoList[0];
-                     if (mainVideo && mainVideo.presetLinks) {
-                        mainVideo.presetLinks.forEach(item => {
-                           const pUrl = typeof item === 'object' ? item.url : item;
-                           const pAuthor = typeof item === 'object' ? (item.author || mainVideo.handle || 'Komentar') : 'Komentar';
-                           
-                           const isCreator = pAuthor.replace('@', '').toLowerCase() === authorHandle.toLowerCase() || 
-                                             pAuthor.toLowerCase().includes('kreator');
-                                             
-                           allPresets.push({
-                              url: pUrl,
-                              source: isCreator ? 'description' : 'comments',
-                              author: pAuthor
-                           });
-                        });
-                     }
-                  }
-               } catch (e) {}
-            }
-         }
-      } catch (e) {}
-
-      // Hapus Duplikat Link yang sama persis
+      // Hapus Duplikat Link
       const uniquePresets = Array.from(new Map(allPresets.map(p => [p.url, p])).values());
 
       return res.status(200).json({
          success: true,
-         debug_url: longUrl,
-         video: { title: videoData.title || '', play: videoData.play || '', author: authorHandle },
+         video: {
+            title: videoData.title || '',
+            play: videoData.play || '',
+            author: authorHandle
+         },
          presets: uniquePresets
       });
+
    } catch (error) {
       return res.status(500).json({ success: false, error: error.message });
    }
-                  }
-         
+      }
+   
