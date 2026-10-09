@@ -12,6 +12,7 @@ export default async function handler(req, res) {
 
    try {
       let longUrl = inputUrl;
+      let videoId = '';
       
       // 1. Auto-expand shortlink (vt.tiktok.com / vm.tiktok.com)
       if (inputUrl.includes('vt.tiktok.com') || inputUrl.includes('vm.tiktok.com')) {
@@ -26,69 +27,90 @@ export default async function handler(req, res) {
          } catch (e) {}
       }
 
-      // 2. Ambil halaman HTML TikTok menggunakan axios
-      const pageRes = await axios.get(longUrl, {
-         headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-         },
-         timeout: 15000
-      });
+      // 2. Ekstraksi ID Video dari URL panjang
+      const videoIdMatch = longUrl.match(/video\/(\d+)/);
+      if (videoIdMatch) {
+          videoId = videoIdMatch[1];
+      }
 
-      const htmlText = pageRes.data;
-      let allPresets = [];
-      let videoTitle = '';
-
-      // 3. Bedah SIGI_STATE atau Universal Data JSON dari HTML TikTok
+      let videoTitle = 'Video TikTok';
+      let playUrl = '';
+      
+      // 3. Ambil data utama video (untuk mendapatkan judul dan URL Video MP4)
       try {
-         const sigiMatch = htmlText.match(/<script id="SIGI_STATE" type="application\/json">([\s\S]*?)<\/script>/);
-         if (sigiMatch && sigiMatch[1]) {
-            const sigiJson = JSON.parse(sigiMatch[1]);
-            const itemModule = sigiJson.ItemModule || {};
-            for (const key in itemModule) {
-               if (itemModule[key].desc) {
-                  videoTitle = itemModule[key].desc;
-               }
-            }
+         const videoDetail = await axios.get(`https://www.tikwm.com/api/?url=${inputUrl}`);
+         if (videoDetail.data.code === 0 && videoDetail.data.data) {
+             videoTitle = videoDetail.data.data.title;
+             playUrl = videoDetail.data.data.play;
+             if (!videoId) videoId = videoDetail.data.data.id;
          }
-      } catch (e) {}
+      } catch(e) {
+         console.error('Gagal mengambil metadata video');
+      }
 
-      // 4. Regex ekstraksi link dengan filter ketat khusus preset/unduhan
-      const urlRegex = /(https?:\/\/[^\s"'<>]+)/g;
-      const rawMatches = htmlText.match(urlRegex) || [];
+      if (!videoId) {
+          return res.status(400).json({ success: false, message: 'Gagal mendapatkan ID Video TikTok.' });
+      }
 
-      rawMatches.forEach(u => {
-         let cleanUrl = u.replace(/['",;\\}\n\r\)]+$/, '').replace(/&amp;/g, '&');
-         
-         // Whitelist domain preset yang sah
-         const isValidPreset = 
-            cleanUrl.includes('alight.link') ||
-            cleanUrl.includes('alightcreative.com') ||
-            cleanUrl.includes('drive.google.com') ||
-            cleanUrl.includes('mediafire.com') ||
-            cleanUrl.includes('mega.nz') ||
-            cleanUrl.includes('pastebin.com') ||
-            cleanUrl.includes('whatsapp.com/channel') ||
-            cleanUrl.toLowerCase().includes('xml');
+      let allPresets = [];
 
-         if (isValidPreset) {
-            allPresets.push({
-               url: cleanUrl,
-               source: 'comments',
-               author: 'Kreator / Komentar'
-            });
-         }
-      });
+      // 4. Ambil data Komentar menggunakan API Khusus untuk mendapatkan teks komentar dinamis
+      try {
+          const commentsRes = await axios.get(`https://www.tikwm.com/api/comment/list?aweme_id=${videoId}&count=50&cursor=0`);
+          
+          if (commentsRes.data.code === 0 && commentsRes.data.data && commentsRes.data.data.comments) {
+              const comments = commentsRes.data.data.comments;
+              const urlRegex = /(https?:\/\/[^\s"'<>]+)/g;
 
-      // Hapus duplikat link
+              // Fungsi untuk mencari dan memfilter URL preset
+              const searchLinks = (text) => {
+                  const rawMatches = text.match(urlRegex) || [];
+                  rawMatches.forEach(u => {
+                     let cleanUrl = u.replace(/['",;\\}\n\r\)]+$/, '').replace(/&amp;/g, '&');
+                     
+                     // Whitelist domain preset (sesuai filter kamu sebelumnya)
+                     const isValidPreset = 
+                        cleanUrl.includes('alight.link') ||
+                        cleanUrl.includes('alightcreative.com') ||
+                        cleanUrl.includes('drive.google.com') ||
+                        cleanUrl.includes('mediafire.com') ||
+                        cleanUrl.includes('mega.nz') ||
+                        cleanUrl.includes('pastebin.com') ||
+                        cleanUrl.includes('whatsapp.com/channel') ||
+                        cleanUrl.toLowerCase().includes('xml');
+
+                     if (isValidPreset) {
+                        allPresets.push({
+                           url: cleanUrl,
+                           source: 'comments'
+                        });
+                     }
+                  });
+              };
+
+              // Looping seluruh komentar utama dan balasan (replies)
+              comments.forEach(c => {
+                  if (c.text) searchLinks(c.text);
+                  // Kadang link ada di komentar balasan (seperti di screenshot mu)
+                  if (c.reply_comment && Array.isArray(c.reply_comment)) {
+                      c.reply_comment.forEach(reply => {
+                          if (reply.text) searchLinks(reply.text);
+                      });
+                  }
+              });
+          }
+      } catch(e) {
+          console.error('Error saat mengambil komentar API:', e.message);
+      }
+
+      // Hapus duplikat link preset
       const uniquePresets = Array.from(new Map(allPresets.map(p => [p.url, p])).values());
 
       return res.status(200).json({
          success: true,
          video: {
-            title: videoTitle || 'Video TikTok',
-            play: '',
+            title: videoTitle,
+            play: playUrl,
             author: 'TikTok'
          },
          presets: uniquePresets
@@ -97,5 +119,5 @@ export default async function handler(req, res) {
    } catch (error) {
       return res.status(500).json({ success: false, error: error.message });
    }
-               }
-      
+                }
+             
