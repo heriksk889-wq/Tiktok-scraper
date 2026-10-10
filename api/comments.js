@@ -11,9 +11,8 @@ export default async function handler(req, res) {
 
    let videoId = '';
    let allPresets = [];
-   let debugLog = []; // Log agar kita tahu prosesnya mati di mana
+   let debugLog = [];
 
-   // ENGINE REGEX (Filter Link)
    const searchLinks = (text) => {
        if (!text) return;
        const regex = /(?:https?:\/\/)?(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?:\/[^\s"'<>()]*)?/gi;
@@ -34,64 +33,82 @@ export default async function handler(req, res) {
 
    // 1. DAPATKAN ID VIDEO
    try {
-       // Coba pakai API untuk dapatkan ID murni (mengatasi link vt.tiktok.com)
        const metaRes = await axios.get(`https://www.tikwm.com/api/?url=${inputUrl}`, { timeout: 4000 });
        if (metaRes.data?.data?.id) {
            videoId = metaRes.data.data.id;
-           debugLog.push('ID berhasil didapat (TikWM)');
+           debugLog.push('ID berhasil (TikWM)');
        }
    } catch (e) {
-       debugLog.push('API TikWM Meta gagal');
+       debugLog.push('ID gagal');
    }
 
-   // Jika gagal, hentikan dan laporkan ke WhatsApp!
    if (!videoId) {
        return res.status(200).json({ success: false, message: `Scraper tidak bisa mendapatkan ID Video. Debug: [${debugLog.join(', ')}]` });
    }
 
-   // 2. BACA KOMENTAR (Coba 2 Jalur agar anti-gagal)
    let commentSuccess = false;
 
-   // Jalur A: TikTok Internal API
+   // Jalur A: TikTok Internal API (Coba lagi dengan count lebih kecil)
    try {
-       const res1 = await axios.get(`https://api22-normal-c-useast1a.tiktokv.com/aweme/v1/comment/list/?aweme_id=${videoId}&count=150`, {
+       const res1 = await axios.get(`https://api22-normal-c-useast1a.tiktokv.com/aweme/v1/comment/list/?aweme_id=${videoId}&count=40`, {
            headers: { 'User-Agent': 'TikTok 26.2.0 rv:262018 (iPhone; iOS 14.4.2; en_US) Cronet' }, timeout: 4000
        });
-       if (res1.data?.comments) {
+       if (res1.data && res1.data.comments && res1.data.comments.length > 0) {
            res1.data.comments.forEach(c => {
                searchLinks(c.text);
                if (c.reply_comment) c.reply_comment.forEach(r => searchLinks(r.text));
            });
            commentSuccess = true;
-           debugLog.push('Komentar terbaca via Internal API');
+           debugLog.push('Sukses Internal');
        } else {
-           debugLog.push('Internal API kosong (diblokir)');
+           debugLog.push('Internal diblokir');
        }
-   } catch(e) { debugLog.push('Internal API Error/Timeout'); }
+   } catch(e) { debugLog.push('Internal Error'); }
 
-   // Jalur B: Jika Jalur A gagal, pakai Jalur B (TikWM)
+   // Jalur B: TikWM Direct (Turunkan ke 40 komentar agar tidak kena rate-limit)
    if (!commentSuccess) {
        try {
-           const res2 = await axios.get(`https://www.tikwm.com/api/comment/list?aweme_id=${videoId}&count=150&cursor=0`, { timeout: 4000 });
-           if (res2.data?.data?.comments) {
+           const res2 = await axios.get(`https://www.tikwm.com/api/comment/list?aweme_id=${videoId}&count=40&cursor=0`, { timeout: 4000 });
+           if (res2.data?.data?.comments && res2.data.data.comments.length > 0) {
                res2.data.data.comments.forEach(c => {
                    searchLinks(c.text);
                    if (c.reply_comment) c.reply_comment.forEach(r => searchLinks(r.text));
                });
                commentSuccess = true;
-               debugLog.push('Komentar terbaca via TikWM');
+               debugLog.push('Sukses TikWM');
            } else {
-               debugLog.push('TikWM kosong');
+               debugLog.push('TikWM Direct diblokir');
            }
-       } catch(e) { debugLog.push('TikWM Error/Timeout'); }
+       } catch(e) { debugLog.push('TikWM Direct Error'); }
    }
 
-   // Jika kedua jalur gagal membaca komentar
+   // Jalur C: BYPASS VERCEL IP MENGGUNAKAN PUBLIC PROXY (Senjata Pamungkas)
    if (!commentSuccess) {
-        return res.status(200).json({ success: false, message: `Komentar gagal diakses oleh Vercel. Debug: [${debugLog.join(' | ')}]` });
+       try {
+           const targetUrl = `https://www.tikwm.com/api/comment/list?aweme_id=${videoId}&count=40&cursor=0`;
+           // Menggunakan proxy AllOrigins untuk mencuci IP AWS Vercel
+           const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
+           const res3 = await axios.get(proxyUrl, { timeout: 6000 });
+           
+           if (res3.data?.data?.comments && res3.data.data.comments.length > 0) {
+               res3.data.data.comments.forEach(c => {
+                   searchLinks(c.text);
+                   if (c.reply_comment) c.reply_comment.forEach(r => searchLinks(r.text));
+               });
+               commentSuccess = true;
+               debugLog.push('Sukses via Proxy AllOrigins');
+           } else {
+               debugLog.push('Proxy kosong');
+           }
+       } catch (e) {
+           debugLog.push('Proxy Error');
+       }
    }
 
-   // 3. BERSIHKAN DUPLIKAT DAN KIRIM
+   if (!commentSuccess) {
+        return res.status(200).json({ success: false, message: `Semua jalur API diblokir oleh TikTok. Debug: [${debugLog.join(' | ')}]` });
+   }
+
    const uniquePresets = Array.from(new Map(allPresets.map(p => [p.url, p])).values());
 
    if (uniquePresets.length === 0) {
@@ -103,5 +120,5 @@ export default async function handler(req, res) {
        video: { title: 'Preset Alight Motion', play: '', author: 'TikTok' },
        presets: uniquePresets
    });
-   }
-      
+                  }
+                                    
